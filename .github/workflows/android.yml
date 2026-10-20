@@ -4,17 +4,28 @@ name: Build Kurse Launcher APK
 on:
   workflow_dispatch:
   push:
-    branches: [ main ]
+    branches:
+      - main
 
 permissions:
   contents: read
 
+concurrency:
+  group: kurse-launcher-build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
-    runs-on: ubuntu-latest
+    name: Build Android APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    env:
+      ANDROID_HOME: ${{ runner.temp }}/android-sdk
+      ANDROID_SDK_ROOT: ${{ runner.temp }}/android-sdk
 
     steps:
-      - name: Check out source
+      - name: Checkout source
         uses: actions/checkout@v4
 
       - name: Set up Java 17
@@ -28,41 +39,81 @@ jobs:
         run: |
           set -euo pipefail
 
-          SDK="$HOME/android-sdk"
+          SDK="$ANDROID_HOME"
+          TOOLS="$SDK/cmdline-tools/latest"
+
           mkdir -p "$SDK/cmdline-tools"
+          mkdir -p "$RUNNER_TEMP/android-cli-download"
 
-          curl -fL \
+          echo "Downloading Google's Android command-line tools..."
+
+          curl --fail --location --retry 5 \
+            --retry-all-errors --retry-delay 3 \
             "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip" \
-            -o "$RUNNER_TEMP/android-tools.zip"
+            --output "$RUNNER_TEMP/android-cli-download/tools.zip"
 
-          unzip -q "$RUNNER_TEMP/android-tools.zip" \
-            -d "$RUNNER_TEMP/android-tools"
+          unzip -q "$RUNNER_TEMP/android-cli-download/tools.zip" \
+            -d "$RUNNER_TEMP/android-cli-download"
 
-          mv "$RUNNER_TEMP/android-tools/cmdline-tools" \
-            "$SDK/cmdline-tools/latest"
+          test -x "$RUNNER_TEMP/android-cli-download/cmdline-tools/bin/sdkmanager"
 
-          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
-          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          mv "$RUNNER_TEMP/android-cli-download/cmdline-tools" "$TOOLS"
+
+          echo "$TOOLS/bin" >> "$GITHUB_PATH"
           echo "$SDK/platform-tools" >> "$GITHUB_PATH"
-          echo "$SDK/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
 
-          export ANDROID_HOME="$SDK"
-          export ANDROID_SDK_ROOT="$SDK"
-          export PATH="$SDK/cmdline-tools/latest/bin:$PATH"
+          "$TOOLS/bin/sdkmanager" --version
 
-          sdkmanager --version
+      - name: Accept Android SDK licenses
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+
+          mkdir -p "$ANDROID_HOME/licenses"
+
+          "$SDKMANAGER" \
+            --sdk_root="$ANDROID_HOME" \
+            --licenses < <(yes)
 
       - name: Install Android SDK packages
         shell: bash
         run: |
           set -euo pipefail
 
-          yes | sdkmanager --sdk_root="$ANDROID_HOME" --licenses
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
 
-          sdkmanager --sdk_root="$ANDROID_HOME" --install \
+          "$SDKMANAGER" \
+            --sdk_root="$ANDROID_HOME" \
+            --install \
             "platform-tools" \
             "platforms;android-35" \
             "build-tools;35.0.0"
+
+      - name: Verify Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -d "$ANDROID_HOME/platforms/android-35"
+          test -x "$ANDROID_HOME/platform-tools/adb"
+          test -x "$ANDROID_HOME/build-tools/35.0.0/aapt"
+
+          echo "Android SDK verification passed."
+
+      - name: Verify project structure
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking project files..."
+
+          test -f settings.gradle -o -f settings.gradle.kts
+          test -d app
+          test -f app/build.gradle -o -f app/build.gradle.kts
+
+          echo "Project structure verified."
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
@@ -70,9 +121,35 @@ jobs:
           gradle-version: '8.9'
 
       - name: Build debug APK
-        run: gradle --no-daemon assembleDebug
+        shell: bash
+        run: |
+          set -euo pipefail
 
-      - name: Upload APK
+          if [ -f gradlew ]; then
+            chmod +x gradlew
+            ./gradlew --no-daemon --stacktrace assembleDebug
+          else
+            gradle --no-daemon --stacktrace assembleDebug
+          fi
+
+      - name: Verify APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK="app/build/outputs/apk/debug/app-debug.apk"
+
+          if [ ! -s "$APK" ]; then
+            echo "::error::APK was not generated or is empty."
+            find app/build/outputs -type f -name '*.apk' -print || true
+            exit 1
+          fi
+
+          ls -lh "$APK"
+          echo "APK verification passed."
+
+      - name: Upload APK artifact
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: Kurse-Launcher-debug-APK
